@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo.png" alt="dq-gpu-fan-control — a DevQuasar project" width="220">
+  <img src="assets/logo-alt.png" alt="dq-gpu-fan-control — a DevQuasar project" width="220">
 </div>
 
 # dq-gpu-fan-control

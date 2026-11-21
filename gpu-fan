@@ -2,7 +2,7 @@
 # gpu-fan - drive a motherboard PWM fan header from GPU temperature.
 #
 # Released into the public domain (The Unlicense). See LICENSE.
-# https://github.com/devquasar-ai/gpu-fan
+# https://github.com/devquasar-ai/dq-gpu-fan-control
 #
 # Design notes
 #  * The daemon never forks per tick: it reads temperatures from ONE long-running

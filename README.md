@@ -1,4 +1,6 @@
-# gpu-fan
+# dq-gpu-fan-control
+
+Installs the `gpu-fan` command and `gpu-fan.service`.
 
 Control a **motherboard fan header** from **GPU temperature** on Linux.
 
@@ -52,8 +54,8 @@ I/O ports. `install.sh --it87` makes the driver load at boot with that option.
 ## Install
 
 ```sh
-git clone https://github.com/devquasar-ai/gpu-fan
-cd gpu-fan
+git clone https://github.com/devquasar-ai/dq-gpu-fan-control
+cd dq-gpu-fan-control
 
 # 1. find your fan header
 ./gpu-fan list                    # PWM chips/channels and current RPM

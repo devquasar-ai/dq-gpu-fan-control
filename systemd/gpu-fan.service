@@ -1,6 +1,6 @@
 [Unit]
 Description=GPU temperature driven motherboard fan control (gpu-fan)
-Documentation=https://github.com/devquasar-ai/gpu-fan
+Documentation=https://github.com/devquasar-ai/dq-gpu-fan-control
 After=systemd-modules-load.service nvidia-persistenced.service
 # never give up restarting a fan controller
 StartLimitIntervalSec=0

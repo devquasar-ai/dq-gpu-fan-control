@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/logo.png" alt="dq-gpu-fan-control — a DevQuasar project" width="220">
+</div>
+
 # dq-gpu-fan-control
 
 Installs the `gpu-fan` command and `gpu-fan.service`.

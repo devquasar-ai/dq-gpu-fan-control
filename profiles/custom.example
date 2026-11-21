@@ -1,0 +1,25 @@
+# Custom gpu-fan profile. Install + activate with:
+#   sudo gpu-fan profile --custom my-curve.conf
+# Values are validated; nothing in this file is executed.
+
+DESCRIPTION="my curve"
+
+# "temperature:percent" points, temperatures ascending. Linear between points,
+# flat before the first and after the last point.
+CURVE="40:30 55:45 65:60 75:85 80:100"
+
+# Never run slower than this while spinning (avoid stalling the fan).
+MIN_PCT=30
+
+# Optional zero-RPM mode: stop the fan below STOP_BELOW, restart at START_AT.
+#STOP_BELOW=40
+#START_AT=46
+
+# Max % decrease per update (fan speeds up immediately, slows down gently).
+STEP_DOWN=3
+
+# When starting from a stop, run at KICK_PCT for KICK_SECS to overcome inertia.
+KICK_PCT=60
+KICK_SECS=3
+
+# Note: regardless of the profile, the fan runs 100% at CRIT_TEMP (gpu-fan.conf).

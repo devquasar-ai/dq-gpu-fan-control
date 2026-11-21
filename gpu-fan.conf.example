@@ -1,0 +1,25 @@
+# /etc/gpu-fan/gpu-fan.conf - written by install.sh. Values are validated, not executed.
+# Apply changes with: sudo systemctl reload gpu-fan
+
+# GPU temperature source: a backend in /usr/local/lib/gpu-fan/gpu/ (nvidia, ...)
+GPU_BACKEND=nvidia
+# "all" (hottest GPU wins) or comma separated indexes, e.g. 0 or 0,2
+GPU_INDEX=all
+
+# Fan header: hwmon chip name (see `gpu-fan list`) and PWM channel
+PWM_CHIP=it8689
+PWM_CHANNEL=2
+# Tachometer channel (default = PWM_CHANNEL); 0 = fan has no RPM signal
+#FAN_CHANNEL=2
+
+# Active profile: silent | normal | performance | a custom one
+PROFILE=normal
+
+# Seconds between updates (1-60)
+INTERVAL=2
+# Fan % on any error, on daemon exit and on fan stall (50-100)
+FAILSAFE_PCT=100
+# Fan is forced to 100% at/above this GPU temperature, whatever the profile
+CRIT_TEMP=85
+# Latch to failsafe if the fan reports 0 RPM while it should spin (1/0)
+STALL_DETECT=1

@@ -1,0 +1,11 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x -s bash gpu-fan install.sh uninstall.sh tests/run.sh gpu/*.sh
+      - name: tests
+        run: tests/run.sh

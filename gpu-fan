@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+# gpu-fan - drive a motherboard PWM fan header from GPU temperature.
+#
+# Released into the public domain (The Unlicense). See LICENSE.
+# https://github.com/devquasar-ai/gpu-fan
+#
+# Design notes
+#  * The daemon never forks per tick: it reads temperatures from ONE long-running
+#    backend process (e.g. `nvidia-smi -l`) and uses only bash builtins in the loop.
+#  * Every failure path ends at FAILSAFE_PCT: bad reading, reader timeout/exit,
+#    stalled fan, daemon exit (trap), daemon kill (systemd ExecStopPost),
+#    daemon hang (systemd watchdog).
+set -u
+shopt -s nullglob
+
+VERSION=0.1.0
+UNIT=gpu-fan.service
+
+# ---------------------------------------------------------------- paths ----
+_self=$(readlink -f "${BASH_SOURCE[0]}")
+_srcdir=${_self%/*}
+if [[ -n ${GPU_FAN_LIB:-} ]]; then LIB=$GPU_FAN_LIB
+elif [[ -d $_srcdir/gpu && -d $_srcdir/profiles ]]; then LIB=$_srcdir   # running from source tree
+else LIB=/usr/local/lib/gpu-fan; fi
+CONF=${GPU_FAN_CONF:-/etc/gpu-fan/gpu-fan.conf}
+ETC_DIR=${CONF%/*}
+HWMON_ROOT=${GPU_FAN_HWMON_ROOT:-/sys/class/hwmon}
+STATE_DIR=${GPU_FAN_STATE_DIR:-/run/gpu-fan}
+STATE=$STATE_DIR/state
+# test mode = fake sysfs; skips root checks and systemctl
+TEST_MODE=0; [[ -n ${GPU_FAN_HWMON_ROOT:-} ]] && TEST_MODE=1
+
+# ------------------------------------------------------------- settings ----
+CONFIG_KEYS="GPU_BACKEND GPU_INDEX PWM_CHIP PWM_CHANNEL FAN_CHANNEL PROFILE INTERVAL FAILSAFE_PCT CRIT_TEMP STALL_DETECT"
+PROFILE_KEYS="DESCRIPTION CURVE MIN_PCT STOP_BELOW START_AT STEP_DOWN KICK_PCT KICK_SECS"
+
+config_defaults() {
+  GPU_BACKEND=nvidia; GPU_INDEX=all; PWM_CHIP=""; PWM_CHANNEL=""; FAN_CHANNEL=""
+  PROFILE=normal; INTERVAL=2; FAILSAFE_PCT=100; CRIT_TEMP=85; STALL_DETECT=1
+}
+profile_defaults() {
+  DESCRIPTION=""; CURVE=""; MIN_PCT=0; STOP_BELOW=""; START_AT=""
+  STEP_DOWN=3; KICK_PCT=60; KICK_SECS=3
+}
+
+# ---------------------------------------------------------------- output ----
+if [[ -t 1 ]]; then C_R=$'\e[31m' C_G=$'\e[32m' C_Y=$'\e[33m' C_B=$'\e[1m' C_0=$'\e[0m'
+else C_R="" C_G="" C_Y="" C_B="" C_0=""; fi
+log()  { printf '%s\n' "$*"; }
+err()  { printf 'gpu-fan: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+need_root() { (( TEST_MODE )) || [[ $EUID == 0 ]] || die "this command needs root (use sudo)"; }
+
+# ------------------------------------------------------------ validation ----
+NUM='(0|[1-9][0-9]{0,2})'
+pct_ok()  { [[ $1 =~ ^$NUM$ ]] && (( $1 <= 100 )); }
+temp_ok() { [[ $1 =~ ^$NUM$ ]] && (( $1 <= 150 )); }
+curve_ok() {
+  local pt t p last=-1 n=0
+  for pt in $1; do
+    [[ $pt =~ ^$NUM:$NUM$ ]] || return 1
+    t=${BASH_REMATCH[1]}; p=${BASH_REMATCH[2]}
+    temp_ok "$t" && pct_ok "$p" && (( t > last )) || return 1
+    last=$t; ((n++))
+  done
+  (( n > 0 ))
+}
+validate() {
+  local k=$1 v=$2
+  case $k in
+    GPU_BACKEND)  [[ $v =~ ^[a-z0-9_-]+$ ]] ;;
+    GPU_INDEX)    [[ $v == all || $v =~ ^[0-9]+(,[0-9]+)*$ ]] ;;
+    PWM_CHIP)     [[ $v =~ ^[A-Za-z0-9_-]+$ ]] ;;
+    PWM_CHANNEL)  [[ $v =~ ^[1-9]$ ]] ;;
+    FAN_CHANNEL)  [[ -z $v || $v =~ ^[0-9]$ ]] ;;          # 0 = no tachometer
+    PROFILE)      [[ $v =~ ^[A-Za-z0-9_-]+$ ]] ;;
+    INTERVAL)     [[ $v =~ ^[1-9]$|^[1-5][0-9]$|^60$ ]] ;;   # 1..60 s
+    FAILSAFE_PCT) pct_ok "$v" && (( v >= 50 )) ;;
+    CRIT_TEMP)    temp_ok "$v" && (( v >= 50 )) ;;
+    STALL_DETECT) [[ $v == [01] ]] ;;
+    DESCRIPTION)  [[ $v =~ ^[^\"\`\$\\]*$ ]] ;;
+    CURVE)        curve_ok "$v" ;;
+    MIN_PCT|KICK_PCT) pct_ok "$v" ;;
+    STEP_DOWN)    pct_ok "$v" && (( v >= 1 )) ;;
+    STOP_BELOW|START_AT) [[ -z $v ]] || temp_ok "$v" ;;
+    KICK_SECS)    [[ $v =~ ^[0-9]{1,2}$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+# Parse KEY=VALUE files without executing them. $3=lenient skips bad lines.
+load_kv() {
+  local f=$1 allowed=" $2 " lenient=${3:-} line key val n=0
+  [[ -r $f ]] || { err "cannot read $f"; return 1; }
+  while IFS= read -r line || [[ -n $line ]]; do
+    ((n++))
+    line=${line%%#*}
+    [[ $line =~ ^[[:space:]]*$ ]] && continue
+    if [[ $line =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(\"([^\"]*)\"|([^\"[:space:]]*))[[:space:]]*$ ]]; then
+      key=${BASH_REMATCH[1]}; val=${BASH_REMATCH[3]}${BASH_REMATCH[4]}
+      if [[ $allowed != *" $key "* ]]; then
+        [[ -n $lenient ]] && continue; err "$f:$n: unknown key '$key'"; return 1
+      fi
+      if ! validate "$key" "$val"; then
+        [[ -n $lenient ]] && continue; err "$f:$n: invalid value for $key: '$val'"; return 1
+      fi
+      printf -v "$key" '%s' "$val"
+    else
+      [[ -n $lenient ]] && continue; err "$f:$n: cannot parse: $line"; return 1
+    fi
+  done < "$f"
+}
+
+load_config() {   # $1=lenient
+  config_defaults
+  [[ -f $CONF ]] || { err "config $CONF not found (run install.sh)"; return 1; }
+  load_kv "$CONF" "$CONFIG_KEYS" "${1:-}" || return 1
+  [[ -n $PWM_CHIP && -n $PWM_CHANNEL ]] || { err "$CONF: PWM_CHIP and PWM_CHANNEL are required"; return 1; }
+  [[ -n $FAN_CHANNEL ]] || FAN_CHANNEL=$PWM_CHANNEL
+}
+
+profile_file() {  # name -> path (etc overrides lib)
+  local d
+  for d in "$ETC_DIR/profiles" "$LIB/profiles"; do
+    [[ -f $d/$1.conf ]] && { printf '%s\n' "$d/$1.conf"; return 0; }
+  done
+  return 1
+}
+load_profile_file() {
+  profile_defaults
+  load_kv "$1" "$PROFILE_KEYS" || return 1
+  [[ -n $CURVE ]] || { err "$1: CURVE is required"; return 1; }
+  if [[ -n $STOP_BELOW ]]; then
+    [[ -n $START_AT ]] || START_AT=$(( STOP_BELOW + 5 ))
+    (( START_AT > STOP_BELOW )) || { err "$1: START_AT must be above STOP_BELOW"; return 1; }
+  elif [[ -n $START_AT ]]; then err "$1: START_AT needs STOP_BELOW"; return 1; fi
+  PROFILE_FILE=$1
+}
+load_profile() {
+  local f; f=$(profile_file "$1") || { err "profile '$1' not found"; return 1; }
+  load_profile_file "$f"
+}
+
+# ------------------------------------------------------------- hardware ----
+find_hwmon() {  # sets HW, PWM, EN, RPM_FILE
+  local n name
+  HW=""
+  for n in "$HWMON_ROOT"/hwmon*/name; do
+    read -r name < "$n" || continue
+    if [[ $name == "$PWM_CHIP" || $name == "${PWM_CHIP}_"* ]]; then HW=${n%/name}; break; fi
+  done
+  [[ -n $HW ]] || return 1
+  PWM=$HW/pwm$PWM_CHANNEL; EN=${PWM}_enable
+  RPM_FILE=""; (( FAN_CHANNEL > 0 )) && [[ -r $HW/fan${FAN_CHANNEL}_input ]] && RPM_FILE=$HW/fan${FAN_CHANNEL}_input
+  [[ -e $PWM && -e $EN ]] || { err "$PWM not found"; return 1; }
+}
+set_pct() {  # write duty cycle, force manual mode; no forks
+  local e=""
+  read -r e < "$EN" 2>/dev/null
+  [[ $e == 1 ]] || { echo 1 > "$EN"; } 2>/dev/null || return 1
+  { echo $(( $1 * 255 / 100 )) > "$PWM"; } 2>/dev/null
+}
+read_rpm() { RPM=""; [[ -n $RPM_FILE ]] && read -r RPM < "$RPM_FILE" 2>/dev/null; [[ $RPM =~ ^[0-9]+$ ]] || RPM=""; }
+
+load_backend() {
+  local f=$LIB/gpu/$GPU_BACKEND.sh
+  [[ -r $f ]] || { err "GPU backend '$GPU_BACKEND' not found ($f)"; return 1; }
+  # shellcheck source=/dev/null
+  source "$f"
+  declare -F gpu_temp_once >/dev/null && declare -F gpu_temp_stream >/dev/null \
+    || { err "backend $f must define gpu_temp_once and gpu_temp_stream"; return 1; }
+}
+
+# ----------------------------------------------------------- fan logic ----
+# Pure logic shared by the daemon and `simulate`. Globals:
+#   CUR (current %), NOW (epoch s), MODE, STALLED, STALL_CNT, KICK_UNTIL, GRACE_UNTIL
+curve_pct() {  # $1=temp -> R (linear interpolation, clamped at both ends)
+  local t=$1 pt t0=-1 p0=0 t1 p1=100
+  for pt in $CURVE; do
+    t1=${pt%:*}; p1=${pt#*:}
+    if (( t <= t1 )); then
+      if (( t0 < 0 )); then R=$p1; else R=$(( p0 + (p1 - p0) * (t - t0) / (t1 - t0) )); fi
+      return
+    fi
+    t0=$t1; p0=$p1
+  done
+  R=$p1
+}
+
+logic_reset() { CUR=$FAILSAFE_PCT; MODE=init; STALLED=0; STALL_CNT=0; KICK_UNTIL=0; GRACE_UNTIL=$(( NOW + 2 * INTERVAL + 5 )); }
+
+tick() {  # $1=temp|ERR  $2=rpm measured at CUR (may be empty) -> CUR, MODE
+  local t=$1 rpm=$2 target prev=$MODE
+  [[ $t =~ ^[0-9]+$ ]] || t=ERR
+  [[ $rpm =~ ^[0-9]+$ ]] || rpm=""
+  # stall detection: fan commanded to spin, past spin-up grace, tach says 0
+  if (( STALL_DETECT && ! STALLED )) && [[ -n $rpm ]] && (( CUR > 0 && NOW >= GRACE_UNTIL )); then
+    if (( rpm == 0 )); then
+      if (( ++STALL_CNT >= 3 )); then STALLED=1; log "ERROR: fan stalled (0 RPM at ${CUR}%) - latched to failsafe ${FAILSAFE_PCT}% until reload"; fi
+    else STALL_CNT=0; fi
+  fi
+
+  if [[ $t == ERR ]]; then target=$FAILSAFE_PCT; MODE=failsafe
+  elif (( STALLED )); then target=$FAILSAFE_PCT; MODE=stalled
+  elif (( t >= CRIT_TEMP )); then target=100; MODE=critical
+  elif [[ -n $STOP_BELOW ]] && { (( CUR == 0 && t < START_AT )) || (( CUR > 0 && t < STOP_BELOW )); }; then
+    target=0; MODE=stopped
+  else
+    curve_pct "$t"; target=$R
+    (( target < MIN_PCT )) && target=$MIN_PCT
+    if (( CUR == 0 && target > 0 )); then                                   # spinning up from stop
+      KICK_UNTIL=$(( NOW + KICK_SECS )); GRACE_UNTIL=$(( KICK_UNTIL + 2 * INTERVAL + 2 ))
+    fi
+    if (( NOW < KICK_UNTIL )); then
+      (( target < KICK_PCT )) && target=$KICK_PCT
+      MODE=kick
+    else
+      # gentle ramp-down, but only while following the curve (not after init/failsafe/kick)
+      [[ $prev == curve || $prev == critical ]] && (( target < CUR - STEP_DOWN )) && target=$(( CUR - STEP_DOWN ))
+      MODE=curve
+    fi
+  fi
+  (( target == 0 )) && STALL_CNT=0
+  CUR=$target
+}
+
+# --------------------------------------------------------------- daemon ----
+write_state() {
+  { printf 'ts=%s\npid=%s\nstarted=%s\nprofile=%s\nbackend=%s\ngpu_index=%s\nchip=%s\npwm=%s\ntemp=%s\npct=%s\nrpm=%s\nmode=%s\nstalled=%s\nend=1\n' \
+      "$NOW" "$$" "$STARTED" "$PROFILE" "$GPU_BACKEND" "$GPU_INDEX" "$PWM_CHIP" "$PWM_CHANNEL" \
+      "$TEMP" "$CUR" "${RPM:-}" "$MODE" "$STALLED" > "$STATE"; } 2>/dev/null
+}
+
+start_reader() {
+  exec {RFD}< <(gpu_temp_stream "$INTERVAL" "$GPU_INDEX" 2>/dev/null)
+  READER_PID=$!
+}
+stop_reader() {
+  [[ -n ${RFD:-} ]] && exec {RFD}<&-
+  [[ -n ${READER_PID:-} ]] && { pkill -P "$READER_PID" 2>/dev/null; kill "$READER_PID" 2>/dev/null; }
+  RFD=""; READER_PID=""
+}
+
+on_exit() {
+  trap - EXIT
+  stop_reader
+  if [[ -n ${EN:-} ]]; then
+    if set_pct "$FAILSAFE_PCT"; then log "exit: fan set to failsafe ${FAILSAFE_PCT}%"
+    else log "exit: FAILED to set failsafe fan speed"; fi
+  fi
+  rm -f "$STATE" 2>/dev/null
+}
+
+do_reload() {
+  RELOAD=0
+  local old="$GPU_BACKEND|$GPU_INDEX|$PWM_CHIP|$PWM_CHANNEL|$FAN_CHANNEL|$INTERVAL"
+  if ! ( load_config && load_profile "$PROFILE" ) >/dev/null; then
+    log "reload: new config/profile is invalid - keeping current settings"; return
+  fi
+  load_config; load_profile "$PROFILE"
+  if [[ $old != "$GPU_BACKEND|$GPU_INDEX|$PWM_CHIP|$PWM_CHANNEL|$FAN_CHANNEL|$INTERVAL" ]]; then
+    log "reload: hardware settings changed - restarting"; exit 0
+  fi
+  STALLED=0; STALL_CNT=0
+  log "reload: profile=$PROFILE (${PROFILE_FILE})"
+}
+
+watchdog_ping() {
+  (( WD_EVERY > 0 && NOW >= WD_NEXT )) || return 0
+  systemd-notify WATCHDOG=1 2>/dev/null
+  WD_NEXT=$(( NOW + WD_EVERY ))
+}
+
+cmd_run() {
+  need_root
+  load_config || exit 1
+  load_profile "$PROFILE" || exit 1
+  load_backend || exit 1
+  local i
+  for (( i = 0; i < 30; i++ )); do find_hwmon && break; sleep 1; done
+  [[ -n $HW ]] || die "PWM chip '$PWM_CHIP' not found under $HWMON_ROOT (is the driver loaded?)"
+  mkdir -p "$STATE_DIR"
+
+  trap on_exit EXIT
+  trap 'exit 0' TERM INT
+  RELOAD=0; trap 'RELOAD=1' HUP
+
+  NOW=$EPOCHSECONDS; STARTED=$NOW; TEMP=""; RPM=""
+  logic_reset
+  set_pct "$CUR" || die "cannot write $PWM"
+  log "gpu-fan $VERSION: backend=$GPU_BACKEND gpus=$GPU_INDEX fan=$PWM rpm=${RPM_FILE:-none} profile=$PROFILE interval=${INTERVAL}s"
+
+  WD_EVERY=0; WD_NEXT=0
+  [[ -n ${WATCHDOG_USEC:-} ]] && WD_EVERY=$(( WATCHDOG_USEC / 3000000 )) && (( WD_EVERY < 1 )) && WD_EVERY=1
+
+  local line rc timeout=$(( INTERVAL * 3 + 5 )) last_mode="" last_pct=-100 last_temp=-100 write_fail=0
+  start_reader
+  while :; do
+    (( RELOAD )) && do_reload
+    if read -r -t "$timeout" -u "$RFD" line; then
+      [[ $line =~ ^$NUM$ ]] && TEMP=$line || TEMP=ERR
+    else
+      rc=$?
+      (( RELOAD )) && continue                       # read interrupted by SIGHUP
+      (( rc > 128 )) && log "temperature reader timed out - failsafe" || log "temperature reader exited - failsafe"
+      TEMP=ERR
+      stop_reader
+    fi
+
+    NOW=$EPOCHSECONDS
+    read_rpm
+    tick "$TEMP" "$RPM"
+    if set_pct "$CUR"; then write_fail=0
+    else (( write_fail++ == 0 )) && log "ERROR: cannot write $PWM"; (( write_fail > 5 )) && die "giving up: PWM not writable"; fi
+    write_state
+    watchdog_ping
+
+    if [[ $MODE != "$last_mode" ]] || (( CUR - last_pct >= 5 || last_pct - CUR >= 5 )) \
+       || { [[ $TEMP =~ ^[0-9]+$ ]] && (( TEMP - last_temp >= 5 || last_temp - TEMP >= 5 )); }; then
+      if [[ $TEMP == ERR ]]; then line=ERR; else line=${TEMP}C; fi
+      log "gpu=$line fan=${CUR}% rpm=${RPM:--} mode=$MODE" 
+      last_mode=$MODE; last_pct=$CUR; [[ $TEMP =~ ^[0-9]+$ ]] && last_temp=$TEMP
+    fi
+
+    if [[ -z $RFD ]]; then sleep "$INTERVAL"; start_reader; fi
+  done
+}
+
+# --------------------------------------------------------- user commands ----
+cmd_failsafe() {   # used by systemd ExecStopPost; must work even with a broken config
+  need_root
+  load_config lenient || true
+  [[ -n $PWM_CHIP && -n $PWM_CHANNEL ]] || die "failsafe: PWM chip/channel unknown"
+  find_hwmon || die "failsafe: $PWM_CHIP not found"
+  set_pct "$FAILSAFE_PCT" && log "fan $PWM set to ${FAILSAFE_PCT}%" || die "failsafe: write failed"
+}
+
+cmd_release() {    # hand the header back to the motherboard's automatic control
+  need_root
+  load_config lenient || true
+  find_hwmon || die "$PWM_CHIP not found"
+  { echo 2 > "$EN"; } 2>/dev/null || die "cannot write $EN"
+  log "$PWM returned to chip/BIOS automatic control"
+}
+
+fmt_age() { local s=$1; (( s < 60 )) && { echo "${s}s"; return; }; (( s < 3600 )) && { echo "$((s/60))m$((s%60))s"; return; }; echo "$((s/3600))h$((s%3600/60))m"; }
+
+cmd_status() {
+  local -A S=() ; local line k v i active now=$EPOCHSECONDS
+  if (( TEST_MODE )); then active=test; else active=$(systemctl is-active "$UNIT" 2>/dev/null); fi
+  for (( i = 0; i < 3; i++ )); do              # state is rewritten every tick; retry torn reads
+    S=()
+    [[ -r $STATE ]] || break
+    while IFS='=' read -r k v; do S[$k]=$v; done < "$STATE"
+    [[ ${S[end]:-} == 1 ]] && break
+    sleep 0.1
+  done
+  load_config lenient >/dev/null 2>&1 || true
+  [[ -f $CONF ]] || printf '%snot installed%s: %s missing (run install.sh)\n' "$C_Y" "$C_0" "$CONF"
+  load_profile "${S[profile]:-$PROFILE}" >/dev/null 2>&1 || CURVE="?"
+  HW=""; [[ -n $PWM_CHIP ]] && find_hwmon 2>/dev/null
+
+  local fresh=0 age=""
+  if [[ ${S[end]:-} == 1 ]]; then age=$(( now - S[ts] )); (( age <= INTERVAL * 3 + 5 )) && fresh=1; fi
+
+  local st
+  if [[ $active == active || $active == test ]] && (( fresh )); then
+    st="${C_G}running${C_0} (pid ${S[pid]}, up $(fmt_age $(( now - S[started] ))))"
+  elif [[ $active == active || $active == activating ]]; then st="${C_Y}starting / no data yet${C_0}"
+  elif (( ${#S[@]} )); then st="${C_R}STALE${C_0} (last update $(fmt_age "$age") ago, service ${active:-unknown})"
+  else st="${C_R}not running${C_0} (service ${active:-unknown})"; fi
+
+  local temp pct mode rpm raw en en_txt
+  if (( fresh )); then temp=${S[temp]}; mode=${S[mode]}
+  else
+    temp="?"; mode="-"
+    if load_backend >/dev/null 2>&1; then temp=$(gpu_temp_once "$GPU_INDEX" 2>/dev/null) || temp="?"; fi
+  fi
+  raw="?"; en=""; rpm="-"
+  if [[ -n $HW ]]; then
+    read -r raw < "$PWM" 2>/dev/null; read -r en < "$EN" 2>/dev/null
+    read_rpm; rpm=${RPM:--}
+  fi
+  case $en in 0) en_txt="full speed";; 1) en_txt="manual";; 2|3|4|5) en_txt="BIOS/auto";; *) en_txt="?";; esac
+  pct="?"; [[ $raw =~ ^[0-9]+$ ]] && pct=$(( (raw * 100 + 127) / 255 ))
+  case $mode in failsafe|stalled|critical) mode="${C_R}${mode}${C_0}";; stopped) mode="${C_Y}${mode}${C_0}";; esac
+
+  printf '%sgpu-fan%s    %s\n' "$C_B" "$C_0" "$st"
+  printf 'profile    %s  [%s]\n' "${S[profile]:-$PROFILE}" "$CURVE"
+  printf 'gpu        %s (%s)  %s°C\n' "$GPU_BACKEND" "$GPU_INDEX" "$temp"
+  printf 'fan        %s pwm%s  %s%% (%s/255, %s)  %s RPM\n' "${PWM_CHIP:-?}" "${PWM_CHANNEL:-?}" "$pct" "$raw" "$en_txt" "$rpm"
+  printf 'mode       %s%s\n' "$mode" "${age:+   (updated $(fmt_age "$age") ago)}"
+}
+
+list_profiles() {
+  local f n cur=""; load_config lenient >/dev/null 2>&1 && cur=$PROFILE
+  local -A seen=()
+  for f in "$ETC_DIR"/profiles/*.conf "$LIB"/profiles/*.conf; do
+    n=${f##*/}; n=${n%.conf}; [[ -n ${seen[$n]:-} ]] && continue; seen[$n]=1
+    ( load_profile_file "$f" >/dev/null 2>&1 && printf '%s %-12s %s\n' "$([[ $n == "$cur" ]] && echo '*' || echo ' ')" "$n" "$DESCRIPTION" ) \
+      || printf '  %-12s %s(invalid: %s)%s\n' "$n" "$C_R" "$f" "$C_0"
+  done
+}
+
+show_profile() {
+  local t line=""
+  printf '%s: %s\n  curve: %s\n  min %s%%' "$1" "$DESCRIPTION" "$CURVE" "$MIN_PCT"
+  [[ -n $STOP_BELOW ]] && printf ', fan stops below %s°C, restarts at %s°C' "$STOP_BELOW" "$START_AT"
+  printf ', ramp-down %s%%/tick\n  ' "$STEP_DOWN"
+  for (( t = 30; t <= 90; t += 5 )); do
+    if [[ -n $STOP_BELOW ]] && (( t < STOP_BELOW )); then R=0; else curve_pct "$t"; (( R < MIN_PCT )) && R=$MIN_PCT; fi
+    (( t >= ${CRIT_TEMP:-85} )) && R=100
+    line+=$(printf '%3s°C:%3s%%  ' "$t" "$R")
+    (( (t - 30) % 25 == 20 )) && line+=$'\n  '
+  done
+  printf '%s\n' "$line"
+}
+
+reload_daemon() {
+  (( TEST_MODE )) && return 0
+  if systemctl is-active -q "$UNIT"; then systemctl reload "$UNIT" && log "daemon reloaded"; fi
+}
+
+set_conf_key() {  # key value
+  if grep -q "^[[:space:]]*$1=" "$CONF"; then sed -i "s|^[[:space:]]*$1=.*|$1=$2|" "$CONF"
+  else printf '%s=%s\n' "$1" "$2" >> "$CONF"; fi
+}
+
+cmd_profile() {
+  case ${1:-} in
+    "") list_profiles ;;
+    --show)
+      load_config lenient >/dev/null 2>&1 || true
+      local n=${2:-$PROFILE}
+      if [[ -f $n ]]; then load_profile_file "$n" || exit 1; else load_profile "$n" || exit 1; fi
+      show_profile "$n" ;;
+    --custom)
+      need_root
+      local f=${2:-} name
+      [[ -n $f ]] || die "usage: gpu-fan profile --custom FILE [NAME]"
+      [[ -f $f ]] || die "$f: no such file"
+      load_profile_file "$f" || die "profile $f is invalid - not installed"
+      name=${3:-${f##*/}}; name=${name%.conf}
+      [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid profile name '$name' (use letters, digits, - and _)"
+      [[ -f $LIB/profiles/$name.conf ]] && die "'$name' is a built-in profile name; pick another (gpu-fan profile --custom $f my-$name)"
+      mkdir -p "$ETC_DIR/profiles"
+      install -m 644 "$f" "$ETC_DIR/profiles/$name.conf" || exit 1
+      log "installed custom profile '$name' -> $ETC_DIR/profiles/$name.conf"
+      set_conf_key PROFILE "$name"; log "active profile: $name"
+      show_profile "$name"
+      reload_daemon ;;
+    -*) die "unknown option $1" ;;
+    *)
+      need_root
+      load_profile "$1" >/dev/null || exit 1
+      load_config lenient >/dev/null 2>&1 || true
+      set_conf_key PROFILE "$1"; log "active profile: $1"
+      reload_daemon ;;
+  esac
+}
+
+cmd_list() {
+  local n name ch d any=0
+  echo "PWM fan controllers ($HWMON_ROOT):"
+  for n in "$HWMON_ROOT"/hwmon*/name; do
+    d=${n%/name}; read -r name < "$n"
+    local pw=("$d"/pwm[0-9]); (( ${#pw[@]} )) || continue
+    any=1; printf '  %s (%s)\n' "$name" "${d##*/}"
+    for ch in "${pw[@]}"; do
+      ch=${ch##*pwm}; local v="" e="" r="-"
+      read -r v < "$d/pwm$ch"; read -r e < "$d/pwm${ch}_enable" 2>/dev/null
+      [[ -r $d/fan${ch}_input ]] && read -r r < "$d/fan${ch}_input"
+      printf '    pwm%s  value=%-3s enable=%-2s fan%s=%s RPM\n' "$ch" "$v" "$e" "$ch" "$r"
+    done
+  done
+  (( any )) || echo "  none found - is the motherboard sensor driver (e.g. it87, nct6775) loaded?"
+  echo "GPU backends ($LIB/gpu):"
+  for n in "$LIB"/gpu/*.sh; do
+    name=${n##*/}; name=${name%.sh}
+    local t; t=$( GPU_BACKEND=$name; load_backend >/dev/null 2>&1 && gpu_temp_once all 2>/dev/null ) && \
+      printf '  %-8s ok, %s°C\n' "$name" "$t" || printf '  %-8s unavailable\n' "$name"
+  done
+}
+
+identify_pulse() {  # dir channel seconds
+  local d=$1 p=$2 s=$3 v e f
+  [[ -e $d/pwm$p ]] || die "pwm$p does not exist"
+  read -r v < "$d/pwm$p"; read -r e < "$d/pwm${p}_enable"
+  trap 'echo "$v" > "$d/pwm$p"; echo "$e" > "$d/pwm${p}_enable"; echo "pwm$p restored"; exit 130' INT TERM
+  echo 1 > "$d/pwm${p}_enable"; echo 255 > "$d/pwm$p"
+  echo ">>> pwm$p at 100% for ${s}s - watch/listen which fan ramps up"
+  sleep "$s"
+  for f in "$d"/fan*_input; do read -r v2 < "$f"; printf '    %s=%s RPM\n' "${f##*/}" "$v2"; done
+  echo "$v" > "$d/pwm$p"; echo "$e" > "$d/pwm${p}_enable"
+  trap - INT TERM
+}
+
+cmd_identify() {
+  need_root
+  local chip="" ch="" d n name
+  while (( $# )); do
+    case $1 in --chip) chip=${2:-}; shift 2 ;; pwm[0-9]|[0-9]) ch=${1#pwm}; shift ;; *) die "usage: gpu-fan identify [--chip NAME] [N]" ;; esac
+  done
+  if [[ -z $chip ]]; then load_config lenient >/dev/null 2>&1 && chip=$PWM_CHIP; fi
+  d=""
+  for n in "$HWMON_ROOT"/hwmon*/name; do
+    read -r name < "$n"; local pw=("${n%/name}"/pwm[0-9]); (( ${#pw[@]} )) || continue
+    if [[ -z $chip || $name == "$chip" || $name == "${chip}_"* ]]; then d=${n%/name}; break; fi
+  done
+  [[ -n $d ]] || die "no PWM chip found${chip:+ matching '$chip'} (see: gpu-fan list)"
+  read -r name < "$d/name"; echo "chip: $name ($d)"
+  if (( TEST_MODE == 0 )) && systemctl is-active -q "$UNIT"; then
+    echo "note: $UNIT is running and may fight this test - stop it first: sudo systemctl stop $UNIT"
+  fi
+  if [[ -n $ch ]]; then identify_pulse "$d" "$ch" 60; echo "done, pwm$ch restored"
+  else
+    for ch in "$d"/pwm[0-9]; do identify_pulse "$d" "${ch##*pwm}" 6; sleep 3; done
+    echo "done, all channels restored"
+  fi
+}
+
+cmd_selftest() {
+  need_root
+  local fail=0 warn=0 t rpm_hi rpm_lo rpm_0 was_active=0 low
+  pass() { printf '  %sPASS%s %s\n' "$C_G" "$C_0" "$*"; }
+  bad()  { printf '  %sFAIL%s %s\n' "$C_R" "$C_0" "$*"; fail=1; }
+  wrn()  { printf '  %sWARN%s %s\n' "$C_Y" "$C_0" "$*"; warn=1; }
+  echo "gpu-fan selftest"
+  load_config && pass "config $CONF" || { bad "config $CONF"; exit 1; }
+  load_profile "$PROFILE" && pass "profile '$PROFILE'" || bad "profile '$PROFILE'"
+  if load_backend; then
+    if t=$(gpu_temp_once "$GPU_INDEX") && [[ $t =~ ^$NUM$ ]]; then pass "GPU temperature ($GPU_BACKEND, gpus=$GPU_INDEX): ${t}°C"
+    else bad "GPU temperature read via '$GPU_BACKEND' failed"; fi
+  else bad "GPU backend '$GPU_BACKEND'"; fi
+  find_hwmon && pass "PWM $PWM" || { bad "PWM chip '$PWM_CHIP' channel $PWM_CHANNEL not found"; exit 1; }
+
+  if (( TEST_MODE == 0 )) && systemctl is-active -q "$UNIT"; then
+    was_active=1; echo "  (stopping $UNIT during the test; it will be restarted)"; systemctl stop "$UNIT"
+  fi
+  local v0 e0; read -r v0 < "$PWM"; read -r e0 < "$EN"
+  # shellcheck disable=SC2064
+  trap "echo \"$v0\" > \"$PWM\"; echo \"$e0\" > \"$EN\"; (( $was_active )) && systemctl start $UNIT" EXIT
+  trap 'exit 130' INT TERM
+
+  local wait=${GPU_FAN_SELFTEST_WAIT:-8}
+  set_pct 100 && pass "PWM write (manual mode)" || { bad "cannot write $PWM"; exit 1; }
+  if [[ -z $RPM_FILE ]]; then
+    wrn "no tachometer (fan${FAN_CHANNEL}_input) - RPM checks and stall detection disabled"
+    sleep 3
+  else
+    echo "  fan -> 100% ..."; sleep "$wait"; read_rpm; rpm_hi=$RPM
+    low=$MIN_PCT; (( low < 20 )) && low=20
+    echo "  fan -> ${low}% (profile minimum) ..."; set_pct "$low"; sleep "$wait"; read_rpm; rpm_lo=$RPM
+    (( rpm_hi > 0 )) && pass "fan spins at 100%: $rpm_hi RPM" || bad "0 RPM at 100% - wrong channel or fan not connected"
+    if (( rpm_lo > 0 )); then pass "fan spins at ${low}%: $rpm_lo RPM"
+    else bad "fan stalls at ${low}% - raise MIN_PCT in profile '$PROFILE'"; fi
+    if (( rpm_hi > 0 && rpm_lo > 0 )); then
+      (( rpm_hi * 10 > rpm_lo * 11 )) && pass "fan responds to PWM ($rpm_lo -> $rpm_hi RPM)" \
+        || wrn "RPM barely changes with PWM ($rpm_lo vs $rpm_hi) - fan may be on DC/voltage mode or not PWM controlled"
+    fi
+    echo "  fan -> 0% (zero-RPM check) ..."; set_pct 0; sleep "$wait"; read_rpm; rpm_0=$RPM
+    if (( rpm_0 == 0 )); then pass "fan stops at 0% (silent profile can stop the fan)"
+    else wrn "fan keeps spinning at 0% ($rpm_0 RPM) - 'stop' modes will only slow it to its minimum"; fi
+  fi
+  set_pct "$FAILSAFE_PCT"
+  echo
+  if (( fail )); then echo "${C_R}selftest FAILED${C_0}"; exit 1
+  elif (( warn )); then echo "${C_Y}selftest passed with warnings${C_0}"
+  else echo "${C_G}selftest passed${C_0}"; fi
+}
+
+cmd_simulate() {   # testing aid: read "temp [rpm]" lines on stdin, print the fan % chosen
+  load_profile "${1:-normal}" >/dev/null || exit 1
+  config_defaults; [[ -n ${2:-} ]] && INTERVAL=$2
+  NOW=0; logic_reset
+  local t r
+  while read -r t r; do
+    NOW=$(( NOW + INTERVAL ))
+    tick "$t" "${r:-}"
+    printf '%s %s %s\n' "$t" "$CUR" "$MODE"
+  done
+}
+
+usage() {
+  cat <<EOF
+gpu-fan $VERSION - control a motherboard PWM fan from GPU temperature
+
+usage: gpu-fan <command> [args]
+
+  status                     show daemon state, profile, GPU temp, fan % and RPM
+                             (works with: watch -n1 gpu-fan status)
+  profile                    list profiles (* = active)
+  profile NAME               switch profile (silent | normal | performance | custom)
+  profile --custom FILE [NAME]  validate, install and activate a custom profile
+  profile --show [NAME|FILE] print a profile's curve
+  selftest                   check temperature reading and fan control end to end
+  list                       list PWM controllers and GPU backends
+  identify [--chip C] [N]    pulse PWM channels to find which header drives which fan
+  failsafe                   set fan to the failsafe speed (used by systemd)
+  release                    hand the fan header back to BIOS/chip automatic control
+  run                        run the control daemon (normally started by systemd)
+  version
+
+config: $CONF
+EOF
+}
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case $cmd in
+    run) cmd_run "$@" ;;
+    status) cmd_status "$@" ;;
+    profile) cmd_profile "$@" ;;
+    selftest) cmd_selftest "$@" ;;
+    list) cmd_list "$@" ;;
+    identify) cmd_identify "$@" ;;
+    failsafe) cmd_failsafe "$@" ;;
+    release) cmd_release "$@" ;;
+    simulate) cmd_simulate "$@" ;;
+    version|--version|-V) echo "gpu-fan $VERSION" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

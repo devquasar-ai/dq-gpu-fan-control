@@ -1,0 +1,36 @@
+[Unit]
+Description=GPU temperature driven motherboard fan control (gpu-fan)
+Documentation=https://github.com/devquasar-ai/gpu-fan
+After=systemd-modules-load.service nvidia-persistenced.service
+# never give up restarting a fan controller
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gpu-fan run
+ExecReload=/bin/kill -HUP $MAINPID
+# Runs after ANY stop, including SIGKILL / OOM / watchdog kill: fan -> failsafe speed
+ExecStopPost=/usr/local/bin/gpu-fan failsafe
+Restart=always
+RestartSec=3
+# Daemon pings every WatchdogSec/3; if it hangs, systemd kills it (-> ExecStopPost -> restart)
+WatchdogSec=30
+NotifyAccess=all
+
+# Resource guards (normal use: a few MB, ~0% CPU)
+MemoryMax=128M
+CPUQuota=10%
+TasksMax=16
+
+# Hardening (needs write access to /sys for the PWM files and /dev/nvidia* for nvidia-smi)
+RuntimeDirectory=gpu-fan
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

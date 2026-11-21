@@ -1,0 +1,8 @@
+# A && log || other : the middle command never fails
+disable=SC2015
+# tests pass expressions to eval/bash -c on purpose
+disable=SC2016
+# `( GPU_BACKEND=x; ... )` subshell scoping is intentional (gpu-fan list)
+disable=SC2030,SC2031
+# false positive on `active=test`
+disable=SC2209

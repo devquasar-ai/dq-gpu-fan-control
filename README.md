@@ -227,6 +227,19 @@ sudo ./uninstall.sh --purge    # removes config and it87 boot settings too
 
 The fan header is handed back to BIOS automatic control.
 
+## Using an AI agent to install
+
+[`AGENTS.md`](AGENTS.md) is written for AI coding agents (Claude Code, Codex,
+Cursor, ...). It covers prerequisite checks, choosing the fan driver for your
+board's chip, distro-specific packages, finding the right fan header, and
+troubleshooting. Point your agent at this repository and ask it to install
+gpu-fan for your GPU.
+
+## Contributing
+
+Hardware and distro reports, and support for other fan controllers (IPMI/BMC,
+USB controllers, ...), are especially wanted. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 Public domain - [The Unlicense](LICENSE). Do whatever you want with it.

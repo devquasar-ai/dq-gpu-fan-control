@@ -20,6 +20,10 @@ nvidia-smi -l ──°C──▶ gpu-fan daemon ──duty %──▶ /sys/class
                        failsafe logic ◀──────────────── RPM (fanX_input) ────────────────┘
 ```
 
+<div align="center">
+  <img src="docs/how-it-works.svg" alt="How gpu-fan cools a fanless GPU: GPU temperature flows through the gpu-fan daemon to a motherboard PWM header; RPM feedback closes the loop." width="860">
+</div>
+
 - Profiles: `silent` (fan stops when cool), `normal`, `performance`, or your own curve
 - Fails safe: any error drives the fan to 100% (details below)
 - Light: one long-running `nvidia-smi` process, no per-tick process spawning,
